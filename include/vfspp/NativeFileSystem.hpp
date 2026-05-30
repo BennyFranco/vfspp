@@ -290,17 +290,18 @@ private:
         if (IsReadOnlyImpl()) {
             return false;
         }
-        
-        auto it = m_Files.find(virtualPath);
-        if (it == m_Files.end()) {
+
+        if (!m_Files.contains(virtualPath))
+        {
             return false;
         }
 
         CloseFileAndCleanupOpenedHandles();
 
-        m_Files.erase(it);
-        
-        return fs::remove(it->second.Info.NativePath());
+        const auto path = m_Files.at(virtualPath);
+        m_Files.erase(virtualPath);
+
+        return fs::remove(path.Info.NativePath());
     }
 
     inline bool CopyFileImpl(const std::string& srcVirtualPath, const std::string& dstVirtualPath, bool overwrite = false)
