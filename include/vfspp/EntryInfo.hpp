@@ -87,11 +87,12 @@ private:
     {
         m_Type = type;
 
+        // Strip the base path first
         std::string strippedFileName = fileName;
-        if (!aliasPath.empty() && fileName.find(aliasPath) == 0) {
-            strippedFileName = fileName.substr(aliasPath.length());
-        } else if (!basePath.empty() && fileName.find(basePath) == 0) {
+        if (!basePath.empty() && fileName.find(basePath) == 0) {
             strippedFileName = fileName.substr(basePath.length());
+        } else if (!aliasPath.empty() && fileName.find(aliasPath) == 0) {
+            strippedFileName = fileName.substr(aliasPath.length());
         }
 
         while (!strippedFileName.empty() && (strippedFileName.front() == '/' || strippedFileName.front() == '\\')) {
