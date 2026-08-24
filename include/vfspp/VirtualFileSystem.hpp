@@ -9,6 +9,9 @@
 #include <concepts>
 #include <type_traits>
 #include <algorithm>
+#include <optional>
+#include <string_view>
+#include <unordered_set>
 
 
 namespace vfspp
@@ -212,6 +215,50 @@ private:
     }
 
 public:
+    static std::string NormalizeVirtualDirectoryPath(std::string_view virtualPath)
+    {
+        if (virtualPath.empty()) {
+            return "/";
+        }
+
+        std::string normalized(virtualPath);
+        while (normalized.size() > 1 && normalized.back() == '/') {
+            normalized.pop_back();
+        }
+
+        if (normalized.empty() || normalized.front() != '/') {
+            normalized.insert(normalized.begin(), '/');
+        }
+
+        return normalized;
+    }
+
+    static bool IsPathWithinBaseDirectory(std::string_view virtualPath, std::string_view baseDirectory)
+    {
+        const std::string normalizedBaseDirectory = NormalizeVirtualDirectoryPath(baseDirectory);
+        if (normalizedBaseDirectory == "/") {
+            return !virtualPath.empty() && virtualPath.front() == '/';
+        }
+
+        return virtualPath == normalizedBaseDirectory
+            || (virtualPath.size() > normalizedBaseDirectory.size()
+                && virtualPath.substr(0, normalizedBaseDirectory.size()) == normalizedBaseDirectory
+                && virtualPath[normalizedBaseDirectory.size()] == '/');
+    }
+
+    static bool IsPathDirectChildOfBaseDirectory(std::string_view virtualPath, std::string_view baseDirectory)
+    {
+        const std::string normalizedBaseDirectory = NormalizeVirtualDirectoryPath(baseDirectory);
+        if (!IsPathWithinBaseDirectory(virtualPath, normalizedBaseDirectory) || virtualPath == normalizedBaseDirectory) {
+            return false;
+        }
+
+        const size_t childStart = normalizedBaseDirectory == "/"
+            ? 1
+            : normalizedBaseDirectory.size() + 1;
+        return virtualPath.find('/', childStart) == std::string::npos;
+    }
+
     
     /*
      * Iterate over all registered filesystems and find first ocurrences of file.
@@ -255,15 +302,33 @@ public:
     }
 
     /*
+     * Get entry information for a specific virtual path
+     */
+    std::optional<EntryInfo> GetEntry(const std::string& virtualPath) const
+    {
+        [[maybe_unused]] auto lock = ThreadingPolicy::Lock(m_Mutex);
+
+        return VisitMountedFileSystems(virtualPath, [&](IFileSystemPtr fs, bool /*isMain*/) -> std::optional<EntryInfo> {
+            return fs->GetEntryInfo(virtualPath);
+        });
+    }
+
+    /*
      * List all files from all registered filesystems
      * Returns a vector of all file paths with their aliases
      * Files from later registered filesystems override earlier ones
      */
-    std::vector<std::string> ListAllFiles() const
+    std::vector<EntryInfo> ListAllEntries(bool excludeDirectories = true) const
+    {
+        return ListAllEntries("/", excludeDirectories, true);
+    }
+
+    std::vector<EntryInfo> ListAllEntries(std::string_view baseDirectory, bool excludeDirectories = true, bool recursive = true) const
     {
         [[maybe_unused]] auto lock = ThreadingPolicy::Lock(m_Mutex);
+        const std::string normalizedBaseDirectory = NormalizeVirtualDirectoryPath(baseDirectory);
         
-        std::vector<std::string> allFiles;
+        std::vector<EntryInfo> allFiles;
         std::unordered_set<std::string> seenFiles;
 
         for (const Alias& alias : m_SortedAlias) {
@@ -276,12 +341,22 @@ public:
             for (auto it = filesystems.rbegin(); it != filesystems.rend(); ++it) {
 
                 IFileSystemPtr fs = *it;
-                const IFileSystem::FilesList& fileList = fs->GetFilesList();
+                const IFileSystem::EntriesList& fileList = fs->GetEntriesList(excludeDirectories);
 
-                for (const auto& fileInfo : fileList) {
-                    const auto& virtualPath = fileInfo.VirtualPath();
+                for (const auto& entryInfo : fileList) {
+                    const auto& virtualPath = entryInfo.VirtualPath();
+                    if (!IsPathWithinBaseDirectory(virtualPath, normalizedBaseDirectory)) {
+                        continue;
+                    }
+                    if (virtualPath == normalizedBaseDirectory) {
+                        continue;
+                    }
+                    if (!recursive && !IsPathDirectChildOfBaseDirectory(virtualPath, normalizedBaseDirectory)) {
+                        continue;
+                    }
+
                     if (seenFiles.emplace(virtualPath).second) {
-                        allFiles.push_back(std::move(virtualPath));
+                        allFiles.push_back(entryInfo);
                     }
                 }
             }
@@ -289,6 +364,62 @@ public:
 
         std::sort(allFiles.begin(), allFiles.end());
         return allFiles;
+    }
+
+    bool MakeDirectory(const std::string& virtualPath)
+    {
+        [[maybe_unused]] auto lock = ThreadingPolicy::Lock(m_Mutex);
+
+        auto result = VisitMountedFileSystems(virtualPath, [&](IFileSystemPtr fs, bool /*isMain*/) -> std::optional<bool> {
+            if (!fs->IsReadOnly() && fs->MakeDirectory(virtualPath)) {
+                return true;
+            }
+            return std::nullopt;
+        });
+
+        return result.value_or(false);
+    }
+
+    bool DeleteDirectory(const std::string& virtualPath, bool recursive = false)
+    {
+        [[maybe_unused]] auto lock = ThreadingPolicy::Lock(m_Mutex);
+
+        auto result = VisitMountedFileSystems(virtualPath, [&](IFileSystemPtr fs, bool /*isMain*/) -> std::optional<bool> {
+            if (fs->IsDirectoryExists(virtualPath) && !fs->IsReadOnly() && fs->DeleteDirectory(virtualPath, recursive)) {
+                return true;
+            }
+            return std::nullopt;
+        });
+
+        return result.value_or(false);
+    }
+
+    bool RenameDirectory(const std::string& srcVirtualPath, const std::string& dstVirtualPath)
+    {
+        [[maybe_unused]] auto lock = ThreadingPolicy::Lock(m_Mutex);
+
+        auto result = VisitMountedFileSystems(srcVirtualPath, [&](IFileSystemPtr fs, bool /*isMain*/) -> std::optional<bool> {
+            if (fs->IsDirectoryExists(srcVirtualPath) && !fs->IsReadOnly() && fs->RenameDirectory(srcVirtualPath, dstVirtualPath)) {
+                return true;
+            }
+            return std::nullopt;
+        });
+
+        return result.value_or(false);
+    }
+
+    bool IsDirectoryExists(const std::string& virtualPath) const
+    {
+        [[maybe_unused]] auto lock = ThreadingPolicy::Lock(m_Mutex);
+
+        auto result = VisitMountedFileSystems(virtualPath, [&](IFileSystemPtr fs, bool /*isMain*/) -> std::optional<bool> {
+            if (fs->IsDirectoryExists(virtualPath)) {
+                return true;
+            }
+            return std::nullopt;
+        });
+
+        return result.value_or(false);
     }
 
 private:
